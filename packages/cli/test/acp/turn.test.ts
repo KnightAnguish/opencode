@@ -175,6 +175,80 @@ describe("acp turn events over the wire", () => {
     expect(await steer()).toEqual({ outcome: "injected" })
     expect(acp.server.prompts).toEqual([expect.objectContaining({ text: "redirect", delivery: "steer", resume: false })])
   })
+
+  test("keeps a prompt open for a background shell and forwards the reply it wakes", async () => {
+    await using acp = await startSession({
+      onPrompt: ({ sessionID, id }) =>
+        turn(
+          sessionID,
+          id,
+          toolStarted(sessionID, "call_bg", "shell"),
+          toolCalled(sessionID, "call_bg", { command: "ping", background: true }),
+          toolSucceeded(
+            sessionID,
+            "call_bg",
+            { status: "running", shellID: "sh_bg" },
+            "Command moved to the background (shell ID: sh_bg).",
+          ),
+        ),
+    })
+    acp.server.jobs.push({
+      kind: "shell",
+      id: "sh_bg",
+      sessionID: acp.sessionId,
+      status: "running",
+      shellID: "sh_bg",
+      command: "ping",
+      time: { started: 1 },
+    })
+    const prompt = acp.prompt(acp.sessionId, "run it in the background")
+    await acp.waitForUpdate(
+      (item) =>
+        item.update.sessionUpdate === "tool_call_update" &&
+        item.update.toolCallId === "call_bg" &&
+        item.update.status === "in_progress",
+    )
+
+    expect(
+      await Promise.race([
+        prompt.then(() => "settled" as const),
+        new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 50)),
+      ]),
+    ).toBe("pending")
+
+    acp.server.jobs.length = 0
+    acp.server.send(
+      durableEvent("session.synthetic", {
+        sessionID: acp.sessionId,
+        text: '<shell id="sh_bg" state="completed" command="ping">pong</shell>',
+        metadata: { source: "shell", shellID: "sh_bg", state: "completed", exit: 0 },
+      }),
+      durableEvent("session.execution.started", { sessionID: acp.sessionId }),
+      textDelta(acp.sessionId, "msg_wake", "The background command finished."),
+      succeeded(acp.sessionId),
+    )
+
+    expect((await prompt).stopReason).toBe("end_turn")
+    expect(turnUpdates(acp.updates)).toContainEqual(
+      expect.objectContaining({
+        update: expect.objectContaining({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "call_bg",
+          status: "completed",
+          title: "ping",
+        }),
+      }),
+    )
+    expect(turnUpdates(acp.updates)).toContainEqual(
+      expect.objectContaining({
+        update: expect.objectContaining({
+          sessionUpdate: "agent_message_chunk",
+          messageId: "msg_wake",
+          content: { type: "text", text: "The background command finished." },
+        }),
+      }),
+    )
+  })
 })
 
 function turnUpdates(updates: readonly SessionNotification[]) {

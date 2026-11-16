@@ -602,6 +602,15 @@ function startServer(options: WireOptions, changed: () => void) {
   const cancelledForms: Array<{ readonly sessionID: string; readonly formID: string; readonly message?: string }> = []
   const repliedForms: FormReply[] = []
   const mcp: Array<{ readonly name: string; readonly directory?: string; readonly config: unknown }> = []
+  const jobs: Array<{
+    kind: string
+    id: string
+    sessionID: string
+    status: string
+    time: { started: number }
+    [key: string]: unknown
+  }> = []
+  const inbox = new Map<string, unknown[]>()
   const fake = {
     requests,
     catalog,
@@ -618,6 +627,8 @@ function startServer(options: WireOptions, changed: () => void) {
     cancelledForms,
     repliedForms,
     mcp,
+    jobs,
+    inbox,
     send(...events: ReadonlyArray<OpenCodeEvent>) {
       events.forEach((event) => {
         const seq = ++counter.events
@@ -752,6 +763,36 @@ function startServer(options: WireOptions, changed: () => void) {
       },
       "/api/session/active": {
         GET: route(() => Response.json({ data: Object.fromEntries([...fake.active].map((id) => [id, { type: "running" }])) })),
+      },
+      "/api/session/:sessionID/inbox": {
+        GET: route((req) => Response.json({ data: fake.inbox.get(req.params.sessionID) ?? [] })),
+      },
+      "/api/experimental/job": {
+        GET: route((_req, query) => {
+          const descends = (from: string | undefined, ancestor: string | undefined) => {
+            const seen = new Set<string>()
+            let current = from
+            while (current !== undefined && !seen.has(current)) {
+              if (current === ancestor) return true
+              seen.add(current)
+              current = fake.sessions.get(current)?.parentID
+            }
+            return false
+          }
+          return Response.json({
+            data: fake.jobs.filter(
+              (job) =>
+                (query.kind === undefined || job.kind === query.kind) &&
+                (query.status === undefined || job.status === query.status) &&
+                (query.sessionID === undefined ||
+                  job.sessionID === query.sessionID ||
+                  (query.descendants === "true" && descends(job.sessionID, query.sessionID))),
+            ),
+          })
+        }),
+      },
+      "/api/experimental/session/:sessionID/wait": {
+        POST: route(() => new Response(null, { status: 204 })),
       },
       "/api/session/:sessionID": {
         GET: route((req) => {

@@ -8,10 +8,14 @@ import { ACPChild } from "./child"
 import { ACPCompaction } from "./compaction"
 import { ACPError } from "./error"
 import {
+  backgroundToolUpdate,
+  canonicalName,
   completedToolUpdate,
   errorToolUpdate,
   pendingToolCall,
   runningToolUpdate,
+  stringValue,
+  toolTitle,
   type DiffSource,
   type ToolInput,
 } from "./tool"
@@ -47,6 +51,8 @@ type RetryStatus = {
 export type TurnState = {
   readonly started: boolean
   readonly tools: ReadonlyMap<string, Tool>
+  /** Background shell tool calls, keyed by shell ID, until their completion notice arrives. */
+  readonly backgroundTools: ReadonlyMap<string, Tool>
   readonly retries: ReadonlyMap<string, RetryStatus>
   readonly compactions: ACPCompaction.Tracked
   readonly children: ReadonlyMap<string, ACPChild.Session>
@@ -83,6 +89,7 @@ export type Folded = {
 export const initial: TurnState = {
   started: false,
   tools: new Map(),
+  backgroundTools: new Map(),
   retries: new Map(),
   compactions: new Map(),
   children: new Map(),
@@ -173,6 +180,20 @@ export function abandon(state: TurnState, ctx: TurnContext): Folded {
     state: { ...state, tools: new Map(), compactions: without(state.compactions, ctx.sessionID) },
     outputs: [
       ...[...state.tools.values()].flatMap((tool) =>
+        route(ctx, state.children.get(tool.sessionID), {
+          sessionUpdate: "tool_call_update",
+          ...errorToolUpdate({
+            toolCallId: tool.id,
+            toolName: tool.name,
+            input: tool.input,
+            metadata: tool.metadata,
+            content: [],
+            error: "Cancelled",
+            cwd: ctx.cwd,
+          }),
+        }),
+      ),
+      ...[...state.backgroundTools.values()].flatMap((tool) =>
         route(ctx, state.children.get(tool.sessionID), {
           sessionUpdate: "tool_call_update",
           ...errorToolUpdate({
@@ -369,6 +390,27 @@ function sessionEvent(
     case "session.tool.success": {
       const key = toolKey(event.data.sessionID, event.data.id)
       const tool = state.tools.get(key) ?? newTool(event.data.sessionID, event.data.id)
+      const shellID = backgroundShellID(tool.name, event.data.metadata)
+      if (shellID) {
+        return {
+          state: {
+            ...state,
+            tools: without(state.tools, key),
+            backgroundTools: new Map(state.backgroundTools).set(shellID, tool),
+          },
+          outputs: send({
+            sessionUpdate: "tool_call_update",
+            ...backgroundToolUpdate({
+              toolCallId: event.data.id,
+              toolName: tool.name,
+              input: tool.input,
+              metadata: event.data.metadata,
+              content: event.data.content,
+              cwd: ctx.cwd,
+            }),
+          }),
+        }
+      }
       return {
         state: { ...state, tools: without(state.tools, key) },
         outputs: send({
@@ -406,6 +448,24 @@ function sessionEvent(
         }),
       }
     }
+    case "session.inbox.enqueued": {
+      const item = event.data.item
+      if (item.type !== "synthetic") return { state, outputs: [] }
+      const settled = settleBackgroundTool(state, ctx, item.payload.metadata, item.payload.text)
+      if (!settled) return { state, outputs: [] }
+      return {
+        state: settled.state,
+        outputs: send({ sessionUpdate: "tool_call_update", ...settled.update }),
+      }
+    }
+    case "session.synthetic": {
+      const settled = settleBackgroundTool(state, ctx, event.data.metadata, event.data.text)
+      if (!settled) return { state, outputs: [] }
+      return {
+        state: settled.state,
+        outputs: send({ sessionUpdate: "tool_call_update", ...settled.update }),
+      }
+    }
     default:
       return { state, outputs: [] }
   }
@@ -413,6 +473,55 @@ function sessionEvent(
 
 function newTool(sessionID: string, id: string, name = "tool"): Tool {
   return { sessionID, id, name, input: {}, metadata: {} }
+}
+
+function settleBackgroundTool(
+  state: TurnState,
+  ctx: TurnContext,
+  metadata: Readonly<Record<string, unknown>> | undefined,
+  text: string,
+) {
+  if (metadata?.source !== "shell" || typeof metadata.shellID !== "string") return undefined
+  const shellID = metadata.shellID
+  const tool = state.backgroundTools.get(shellID)
+  if (!tool) return undefined
+  const content = [{ type: "text" as const, text }]
+  const failed =
+    metadata.state === "error" ||
+    metadata.state === "failed" ||
+    metadata.state === "cancelled" ||
+    (typeof metadata.exit === "number" && metadata.exit !== 0)
+  const update = failed
+    ? errorToolUpdate({
+        toolCallId: tool.id,
+        toolName: tool.name,
+        input: tool.input,
+        metadata,
+        content,
+        error:
+          metadata.state === "cancelled"
+            ? "Cancelled"
+            : typeof metadata.exit === "number"
+              ? `Exit code: ${metadata.exit}`
+              : "Command failed",
+        cwd: ctx.cwd,
+      })
+    : completedToolUpdate({
+        toolCallId: tool.id,
+        toolName: tool.name,
+        input: tool.input,
+        metadata,
+        content,
+        title: toolTitle(tool.name, tool.input),
+        cwd: ctx.cwd,
+      })
+  return { state: { ...state, backgroundTools: without(state.backgroundTools, shellID) }, update }
+}
+
+function backgroundShellID(toolName: string, metadata: Record<string, unknown> | undefined) {
+  if (canonicalName(toolName) !== "shell") return undefined
+  if (metadata?.status !== "running") return undefined
+  return stringValue(metadata.shellID)
 }
 
 function route(ctx: TurnContext, child: ACPChild.Session | undefined, update: SessionUpdate): Output[] {

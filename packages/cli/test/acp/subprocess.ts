@@ -36,6 +36,7 @@ type Waiter = {
 type AcpProcess = {
   readonly pid: number
   readonly exited: Promise<number>
+  readonly messages: JsonRpcMessage[]
   readonly request: <T>(method: string, params?: unknown) => Promise<JsonRpcResponse<T>>
   readonly close: () => Promise<number>
   readonly stderr: () => string
@@ -45,6 +46,8 @@ type AcpProcess = {
 export async function createAcpFixture(
   options: {
     readonly respond?: (request: unknown) => string | Response | Promise<string | Response>
+    readonly config?: Record<string, unknown>
+    readonly command?: readonly string[]
   } = {},
 ) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-cli-acp-"))
@@ -70,7 +73,10 @@ export async function createAcpFixture(
       })
     },
   })
-  await Bun.write(path.join(config, "opencode.json"), JSON.stringify(verifierConfig(`http://127.0.0.1:${llm.port}/v1`)))
+  await Bun.write(
+    path.join(config, "opencode.json"),
+    JSON.stringify({ ...verifierConfig(`http://127.0.0.1:${llm.port}/v1`), ...options.config }),
+  )
   await Bun.write(models, "{}")
 
   const processes = new Set<AcpProcess>()
@@ -80,6 +86,7 @@ export async function createAcpFixture(
     llm: { requests },
     spawn() {
       const acp = spawnAcp({
+        command: options.command,
         env: isolatedEnv(root, {
           USERPROFILE: root,
           OPENCODE_CONFIG: undefined,
@@ -185,8 +192,11 @@ function verifierConfig(llmUrl: string) {
   }
 }
 
-function spawnAcp(input: { readonly env: Record<string, string | undefined> }): AcpProcess {
-  const child = Bun.spawn([process.execPath, "run", "src/index.ts", "acp"], {
+function spawnAcp(input: {
+  readonly command?: readonly string[]
+  readonly env: Record<string, string | undefined>
+}): AcpProcess {
+  const child = Bun.spawn(input.command ? [...input.command] : [process.execPath, "run", "src/index.ts", "acp"], {
     cwd: path.join(import.meta.dir, "../.."),
     env: input.env,
     stdin: "pipe",
@@ -293,6 +303,7 @@ function spawnAcp(input: { readonly env: Record<string, string | undefined> }): 
   return {
     pid: child.pid,
     exited: child.exited,
+    messages,
     request,
     async close() {
       if (!inputClosed) {

@@ -1,9 +1,12 @@
 import type { CancelNotification, PromptRequest, PromptResponse, RequestError } from "@agentclientprotocol/sdk"
 import type { OpenCodeClient, OpenCodeEvent } from "@opencode/client/effect"
+import { Session } from "@opencode/schema/session"
 import { TokenUsage } from "@opencode/schema/token-usage"
 import {
   Cause,
+  Clock,
   Context,
+  DateTime,
   Deferred,
   Duration,
   Effect,
@@ -61,6 +64,8 @@ type Turn = {
   readonly subscription: Subscription
   readonly cancelled: Deferred.Deferred<void>
   readonly background: boolean
+  /** Sessions whose background work this turn waits for, including subagent children seen in job results. */
+  readonly jobSessions: Set<string>
 }
 
 export const make = Effect.fnUntraced(function* (input: {
@@ -93,7 +98,14 @@ export const make = Effect.fnUntraced(function* (input: {
       Effect.forever,
       Effect.forkIn(subscriptionScope),
     )
-    return { ctx, state, subscription, cancelled: yield* Deferred.make<void>(), background: false } satisfies Turn
+    return {
+      ctx,
+      state,
+      subscription,
+      cancelled: yield* Deferred.make<void>(),
+      background: false,
+      jobSessions: new Set([ctx.sessionID]),
+    } satisfies Turn
   })
 
   const take = (subscription: Subscription) =>
@@ -200,6 +212,57 @@ export const make = Effect.fnUntraced(function* (input: {
     }
   }
 
+  // Background work outlives the execution that started it. A prompt stays open until its jobs,
+  // their wake notices, and the wake executions are all quiet, so the client keeps showing the
+  // turn as active and receives the wake reply without sending another prompt.
+  const background = Effect.fnUntraced(function* (turn: Turn, since: number) {
+    const state = yield* Ref.get(turn.state)
+    for (const sessionID of state.children.keys()) turn.jobSessions.add(sessionID)
+    const jobs = yield* input.client.experimental.job
+      .list({ sessionID: turn.ctx.sessionID, descendants: true })
+      .pipe(
+        Effect.catchCause((cause) =>
+          Cause.hasInterruptsOnly(cause)
+            ? Effect.interrupt
+            : Effect.logWarning("ACP background job list failed", cause).pipe(Effect.as([])),
+        ),
+      )
+    const running = jobs.filter((job) => job.time.started >= since)
+    for (const job of running) {
+      turn.jobSessions.add(job.sessionID)
+      if (job.kind === "subagent") turn.jobSessions.add(job.childSessionID)
+    }
+    if (running.length > 0) return true
+    const inboxes = yield* Effect.forEach(
+      [...turn.jobSessions],
+      (sessionID) =>
+        input.client.session.inbox.list({ sessionID: Session.ID.make(sessionID) }).pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.interrupt
+              : Effect.logWarning("ACP inbox list failed", cause).pipe(Effect.as([])),
+          ),
+        ),
+      { concurrency: "unbounded" },
+    )
+    if (inboxes.some((inbox) => inbox.length > 0)) return true
+    const active = yield* input.client.session.active().pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Effect.logWarning("ACP active session list failed", cause).pipe(Effect.as({})),
+      ),
+    )
+    return Object.keys(active).some((sessionID) => turn.jobSessions.has(sessionID))
+  })
+
+  const waitIdle = (sessionID: Session.ID) =>
+    input.client.experimental.session.wait({ sessionID }).pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause) ? Effect.interrupt : Effect.logWarning("ACP session wait failed", cause),
+      ),
+    )
+
   const advance = Effect.fnUntraced(function* (turn: Turn) {
     const event = yield* take(turn.subscription)
     const folded = yield* Ref.modify(turn.state, (current) => {
@@ -213,13 +276,20 @@ export const make = Effect.fnUntraced(function* (input: {
     return folded
   })
 
-  const consume = Effect.fnUntraced(function* (turn: Turn) {
+  const consume = Effect.fnUntraced(function* (turn: Turn, since: Deferred.Deferred<number>) {
+    let terminal: ACPTranslate.Terminal | undefined
     while (true) {
       const folded = yield* advance(turn)
-      if (folded.terminal) {
-        yield* asksSettled(turn.subscription)
-        return folded.terminal
-      }
+      if (folded.terminal) terminal = folded.terminal
+      if (!terminal) continue
+      // Only work started by this prompt belongs to the turn; older jobs may belong to another client.
+      const started = yield* Deferred.await(since)
+      yield* waitIdle(turn.ctx.sessionID)
+      if (yield* background(turn, started)) continue
+      // A wake can finish before this check; its events are already queued and still belong to this turn.
+      if ((yield* Queue.size(turn.subscription.events)) > 0) continue
+      yield* asksSettled(turn.subscription)
+      return terminal
     }
   })
 
@@ -265,9 +335,10 @@ export const make = Effect.fnUntraced(function* (input: {
         .pipe(Effect.catch(ACPClient.classify))
       return
     }
-    yield* input.client.session
+    const admitted = yield* input.client.session
       .prompt({ sessionID, id: prompt.start.id, text: prompt.text, files: prompt.files, delivery: "steer" })
       .pipe(Effect.catch(ACPClient.classify))
+    return DateTime.toEpochMillis(admitted.time.created)
   })
 
   const windDown = Effect.fnUntraced(function* (
@@ -296,9 +367,11 @@ export const make = Effect.fnUntraced(function* (input: {
       const connected = yield* take(turn.subscription)
       if (connected.type !== "server.connected")
         return yield* Effect.die(new Error(`expected server.connected, got ${connected.type}`))
-      const events = yield* consume(turn).pipe(Effect.forkScoped)
+      const since = yield* Deferred.make<number>()
+      const events = yield* consume(turn, since).pipe(Effect.forkScoped)
       return yield* Effect.gen(function* () {
-        yield* submit(attached, prompt)
+        const admitted = yield* submit(attached, prompt)
+        yield* Deferred.succeed(since, admitted ?? (yield* Clock.currentTimeMillis))
         if (prompt.command) return "succeeded" as const
         return yield* Fiber.join(events)
       }).pipe(Effect.onInterrupt(() => windDown(turn, events)))

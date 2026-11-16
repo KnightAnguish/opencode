@@ -244,6 +244,42 @@ const rows: Row[] = [
     },
   },
   {
+    name: "keeps a background shell in progress until its notice arrives",
+    events: live(
+      toolStarted(root, "call_bg", "shell"),
+      toolCalled(root, "call_bg", { command: "ping", background: true }),
+      toolSucceeded(root, "call_bg", { status: "running", shellID: "sh_bg" }, "Command moved to the background"),
+      durableEvent("session.inbox.enqueued", {
+        sessionID: root,
+        inboxID: "msg_bg",
+        item: {
+          type: "synthetic",
+          delivery: "steer",
+          payload: {
+            text: '<shell id="sh_bg" state="completed" command="ping">pong\nExit code: 3</shell>',
+            metadata: { source: "shell", shellID: "sh_bg", state: "completed", exit: 3 },
+          },
+        },
+      }),
+    ),
+    expected: {
+      updates: [
+        { sessionUpdate: "tool_call", toolCallId: "call_bg", name: "shell", status: "pending" },
+        { sessionUpdate: "tool_call_update", status: "in_progress", title: "ping" },
+        { sessionUpdate: "tool_call_update", status: "in_progress", title: "Background job running: ping" },
+        {
+          sessionUpdate: "tool_call_update",
+          status: "failed",
+          title: "ping",
+          rawOutput: {
+            metadata: { source: "shell", shellID: "sh_bg", state: "completed", exit: 3 },
+            error: "Exit code: 3",
+          },
+        },
+      ],
+    },
+  },
+  {
     name: "fails a tool call with its partial content and error",
     events: live(
       toolStarted(root, "call_fail", "read"),

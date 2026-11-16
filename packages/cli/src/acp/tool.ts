@@ -103,6 +103,7 @@ export function completedToolUpdate(input: {
   readonly input: ToolInput
   readonly content: ReadonlyArray<Tool.Content>
   readonly metadata?: Readonly<Record<string, unknown>>
+  readonly title?: string
   readonly cwd: string
 }): ToolCallUpdate {
   const normalized = toolContent(input.content)
@@ -116,8 +117,34 @@ export function completedToolUpdate(input: {
   return {
     toolCallId: input.toolCallId,
     status: "completed",
+    ...(input.title === undefined
+      ? {}
+      : { title: input.title, kind: toToolKind(input.toolName), rawInput: rawInput(input.toolName, input.input, input.cwd) }),
     locations: toLocations(input.toolName, input.input, input.cwd),
     content: [...primary, ...images],
+    rawOutput: {
+      ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
+    },
+  }
+}
+
+/** A background shell keeps its tool card in progress until its completion notice arrives. */
+export function backgroundToolUpdate(input: {
+  readonly toolCallId: string
+  readonly toolName: string
+  readonly input: ToolInput
+  readonly content: ReadonlyArray<Tool.Content>
+  readonly metadata?: Readonly<Record<string, unknown>>
+  readonly cwd: string
+}): ToolCallUpdate {
+  return {
+    toolCallId: input.toolCallId,
+    status: "in_progress",
+    kind: toToolKind(input.toolName),
+    title: `Background job running: ${toolTitle(input.toolName, input.input)}`,
+    locations: toLocations(input.toolName, input.input, input.cwd),
+    rawInput: rawInput(input.toolName, input.input, input.cwd),
+    content: toolContent(input.content),
     rawOutput: {
       ...(input.metadata === undefined ? {} : { metadata: input.metadata }),
     },
@@ -157,7 +184,7 @@ function toolContent(content: ReadonlyArray<Tool.Content>): ToolCallContent[] {
   })
 }
 
-function toolTitle(toolName: string, input: ToolInput, fallback?: string) {
+export function toolTitle(toolName: string, input: ToolInput, fallback?: string) {
   if (isShell(toolName)) return stringValue(input.command) ?? stringValue(input.cmd) ?? fallback ?? toolName
   return fallback || toolName
 }
