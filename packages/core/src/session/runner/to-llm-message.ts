@@ -112,6 +112,21 @@ const toolCall = (tool: SessionMessage.AssistantTool, providerMetadata: Provider
   })
 
 const toolResult = (tool: SessionMessage.AssistantTool, providerMetadata: ProviderMetadata | undefined) => {
+  if (tool.executed === true && (tool.state.status === "running" || tool.state.status === "streaming")) {
+    // A persisted in-flight tool only reaches history after an interrupted
+    // turn. Give the model an explicit error result instead of a dangling call.
+    return ToolResultPart.make({
+      id: tool.id,
+      name: tool.name,
+      result: {
+        error: { type: "tool.error", message: "Tool call was interrupted before completion." },
+        content: [],
+      },
+      resultType: "error",
+      providerExecuted: tool.executed,
+      providerMetadata,
+    })
+  }
   if (tool.state.status === "completed") {
     // TODO: Materialize remote and managed URIs before provider-history lowering.
     const content = tool.state.content

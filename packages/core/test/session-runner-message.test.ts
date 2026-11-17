@@ -1226,4 +1226,40 @@ Earlier work
       },
     ])
   })
+
+  test("turns an interrupted running tool into an error result", () => {
+    const assistant = SessionMessage.Assistant.make({
+      id: id("assistant-interrupted"),
+      type: "assistant",
+      agent: build,
+      model: { id: Model.ID.make("model"), providerID: Provider.ID.make("provider") },
+      content: [
+        SessionMessage.AssistantTool.make({
+          type: "tool",
+          id: "call_interrupted",
+          name: "shell",
+          executed: true,
+          time: { created },
+          state: SessionMessage.ToolStateRunning.make({
+            status: "running",
+            input: { command: "pwd" },
+            metadata: {},
+          }),
+        }),
+      ],
+      time: { created, completed: created },
+    })
+
+    const messages = toLLMMessages([assistant], model)
+    expect(messages[0]?.content.find((part) => part.type === "tool-result")).toMatchObject({
+      type: "tool-result",
+      id: "call_interrupted",
+      result: {
+        type: "error",
+        value: {
+          error: { type: "tool.error", message: "Tool call was interrupted before completion." },
+        },
+      },
+    })
+  })
 })
