@@ -167,11 +167,19 @@ export function make(input: {
       const session = yield* getSession(params.sessionId, params.cwd)
       yield* ACPDirectories.activate(input.client, session, directories)
       const attachment = yield* input.sessions.attach(session, session.location.directory, mcpServers)
+      // A foreground tool cannot outlive the process that ran it. If the
+      // session is idle, any tool still marked running in history was
+      // interrupted by a restart and must not be replayed as live.
+      const active = yield* input.client.session
+        .active()
+        .pipe(Effect.catchCause(() => Effect.succeed(undefined as Record<string, unknown> | undefined)))
+      const interrupted = active !== undefined && !Object.prototype.hasOwnProperty.call(active, session.id)
       return yield* ACPReplay.history(
         input.client,
         input.connection,
         attachment.attached,
         yield* Ref.get(input.capabilities),
+        interrupted,
       ).pipe(
         Effect.andThen(currentOptions(attachment.attached)),
         Effect.map((configOptions) => ({ configOptions })),

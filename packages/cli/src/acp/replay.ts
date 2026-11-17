@@ -17,6 +17,7 @@ export function history(
   connection: ACPConnection.Interface,
   attached: Attached,
   capabilities: Capabilities,
+  interrupted = false,
 ) {
   return Stream.paginate(undefined, (cursor: string | undefined) =>
     (cursor
@@ -29,7 +30,7 @@ export function history(
   ).pipe(
     Stream.runForEach((message) =>
       Effect.forEach(
-        updates(message, attached.cwd, capabilities),
+        updates(message, attached.cwd, capabilities, interrupted),
         (update) =>
           ACPPermission.withCompletedDiffs(update, completedSource(message, update), attached.cwd).pipe(
             Effect.flatMap((enriched) => connection.sessionUpdate({ sessionId: attached.id, update: enriched })),
@@ -40,7 +41,15 @@ export function history(
   )
 }
 
-export function updates(message: SessionMessage.Info, cwd: string, capabilities: Capabilities): SessionUpdate[] {
+const INTERRUPTED_TOOL_ERROR =
+  "Interrupted before completion: the agent restarted while this tool was running."
+
+export function updates(
+  message: SessionMessage.Info,
+  cwd: string,
+  capabilities: Capabilities,
+  interrupted = false,
+): SessionUpdate[] {
   if (message.type === "user")
     return [
       { sessionUpdate: "user_message_chunk", messageId: message.id, content: { type: "text", text: message.text } },
@@ -101,10 +110,27 @@ export function updates(message: SessionMessage.Info, cwd: string, capabilities:
       case "running":
         return [
           call,
-          {
-            sessionUpdate: "tool_call_update",
-            ...runningToolUpdate({ toolCallId: part.id, toolName: part.name, state: { input: part.state.input }, cwd }),
-          },
+          interrupted
+            ? {
+                sessionUpdate: "tool_call_update",
+                ...errorToolUpdate({
+                  toolCallId: part.id,
+                  toolName: part.name,
+                  input: part.state.input,
+                  metadata: part.state.metadata,
+                  error: INTERRUPTED_TOOL_ERROR,
+                  cwd,
+                }),
+              }
+            : {
+                sessionUpdate: "tool_call_update",
+                ...runningToolUpdate({
+                  toolCallId: part.id,
+                  toolName: part.name,
+                  state: { input: part.state.input },
+                  cwd,
+                }),
+              },
         ]
       case "error":
         return [

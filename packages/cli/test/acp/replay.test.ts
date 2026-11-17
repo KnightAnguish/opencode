@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test"
-import type { SessionMessage } from "@opencode/schema/session-message"
+import { SessionMessage } from "@opencode/schema/session-message"
 import path from "node:path"
+import { Schema } from "effect"
+import { ACPReplay } from "../../src/acp/replay"
 import { tmpdir } from "../fixture/tmpdir"
 import { assistantMessage, fileDiff, makeSession, startWire } from "./wire-fixture"
 
@@ -52,9 +54,18 @@ describe("acp session replay over the wire", () => {
     })
     expect(updates[8]?.update).toMatchObject({
       toolCallId: "call_running",
-      status: "in_progress",
+      status: "failed",
       title: "pwd",
       locations: [{ path: "/workspace" }],
+      content: [
+        {
+          type: "content",
+          content: {
+            type: "text",
+            text: "Interrupted before completion: the agent restarted while this tool was running.",
+          },
+        },
+      ],
     })
     expect(updates[10]?.update).toMatchObject({
       toolCallId: "call_failed",
@@ -73,6 +84,45 @@ describe("acp session replay over the wire", () => {
         { type: "content", content: { type: "text", text: "edited" } },
         { type: "diff", path: edited, oldText: "one\r\ntwo\r\n", newText: "one\r\nthree\r\n" },
       ],
+    })
+  })
+})
+
+describe("acp replay of interrupted tools", () => {
+  test("marks a stale running tool as failed only when its session is idle", () => {
+    const message = Schema.decodeUnknownSync(SessionMessage.Info)(
+      assistantMessage("msg_running", {
+        time: { created: 2 },
+        content: [
+          {
+            type: "tool",
+            id: "call_running",
+            name: "shell",
+            time: { created: 2 },
+            state: { status: "running", input: { command: "pwd" }, metadata: {} },
+          },
+        ],
+      }),
+    )
+    const capabilities = { childSessionUpdates: false, formElicitation: false, compaction: false }
+
+    expect(ACPReplay.updates(message, "/workspace", capabilities, true).at(-1)).toMatchObject({
+      toolCallId: "call_running",
+      status: "failed",
+      content: [
+        {
+          type: "content",
+          content: {
+            type: "text",
+            text: "Interrupted before completion: the agent restarted while this tool was running.",
+          },
+        },
+      ],
+    })
+    expect(ACPReplay.updates(message, "/workspace", capabilities, false).at(-1)).toMatchObject({
+      toolCallId: "call_running",
+      status: "in_progress",
+      title: "pwd",
     })
   })
 })
